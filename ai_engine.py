@@ -7,6 +7,7 @@ import re
 
 import config
 import stats as st
+import auto_select
 
 
 # ============================================================
@@ -43,13 +44,14 @@ def _call_poe(system_prompt, user_prompt, max_tokens=4000):
         timeout=600.0,  # 10分钟超时(含思考时间)
     )
 
-    effort = getattr(config, "POE_OUTPUT_EFFORT", "high")
+    effort = getattr(config, "POE_OUTPUT_EFFORT", "max")
+    fallback_effort = "high"  # 超时降级等级
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
-                print(f"      第{attempt}次重试...")
+                print(f"      第{attempt}次重试 (effort={effort})...")
 
             # 使用流式响应，防止长思考导致连接超时
             params = dict(
@@ -80,18 +82,30 @@ def _call_poe(system_prompt, user_prompt, max_tokens=4000):
 
         except (openai.APITimeoutError, openai.APIConnectionError) as e:
             if attempt < max_retries:
-                wait = attempt * 10
-                print(f"      网络超时，{wait}秒后重试... ({attempt}/{max_retries})")
-                _time.sleep(wait)
+                # 第一次超时：降级 max → high，再重试
+                if effort == "max" and fallback_effort:
+                    print(f"      ⚠️ max模式超时，自动降级为 {fallback_effort} 重试...")
+                    effort = fallback_effort
+                    _time.sleep(5)
+                else:
+                    wait = attempt * 10
+                    print(f"      网络超时，{wait}秒后重试... ({attempt}/{max_retries})")
+                    _time.sleep(wait)
             else:
-                raise Exception(f"连续{max_retries}次超时，请检查网络后重试") from e
+                raise Exception(f"连续{max_retries}次超时(最后effort={effort})，请检查网络后重试") from e
         except Exception as e:
             err_msg = str(e).lower()
-            # 处理Poe服务端断连(incomplete chunked read)
-            if ("incomplete" in err_msg or "chunked" in err_msg or "peer closed" in err_msg) and attempt < max_retries:
-                wait = attempt * 10
-                print(f"      连接中断，{wait}秒后重试... ({attempt}/{max_retries})")
-                _time.sleep(wait)
+            # 处理Poe服务端断连(incomplete chunked read) / budget_tokens错误
+            if ("incomplete" in err_msg or "chunked" in err_msg or "peer closed" in err_msg
+                    or "budget_tokens" in err_msg) and attempt < max_retries:
+                if effort == "max":
+                    print(f"      ⚠️ max模式出错，自动降级为 {fallback_effort} 重试...")
+                    effort = fallback_effort
+                    _time.sleep(5)
+                else:
+                    wait = attempt * 10
+                    print(f"      连接中断，{wait}秒后重试... ({attempt}/{max_retries})")
+                    _time.sleep(wait)
             else:
                 raise
 
@@ -198,68 +212,95 @@ AC值: {json.dumps(full_stats['AC值分布'], ensure_ascii=False)}
 
 FILTER_SYSTEM_PROMPT = """你是一位资深的福彩3D数据分析专家。
 
-你的任务是：基于历史数据分析，输出精确的过滤条件JSON，系统会自动执行过滤生成号码。
+你的任务是：基于历史统计分布数据，为每个过滤条件选出高概率选项，输出过滤条件JSON。
 
-重要规则：
-1. 基于数据的统计规律给出过滤条件，每个条件必须有依据
-2. 最终过滤后注数应控制在 20-80 注之间（太少容易漏，太多没意义）
-3. 如果条件过紧(预估<15注)就放宽条件；如果过松(预估>100注)就收紧条件
-4. 优先使用置信度高的条件（位置号码、和值、跨度、AC值）
-5. 你必须严格按照指定的JSON格式输出，不要遗漏任何字段
-6. 投注方式为"直选"（百十个位顺序固定），不是组选！不要用组选类型过滤！
-7. 组选类型字段必须留空[]，因为直选模式下组三/组六/豹子都可能中奖
+⚠️⚠️⚠️ 最重要的三条规则 ⚠️⚠️⚠️
 
-JSON输出格式（必须严格遵守）：
+规则一：【不要杀号！】
+百位、十位、个位字段必须留空[]！从1000注开始，完全依靠统计过滤条件来缩小范围。
+杀号是最危险的操作——杀错一个号，后面全部白费。
+
+规则二：【每个条件必须看统计分布数据来选！】
+我会给你每个指标的统计分布（相当于软件里的统计柱状图）。
+你必须选出现次数最多的选项。不允许拍脑袋。
+例如：奇偶比分布 {"1:2":22, "2:1":21, "0:3":4, "3:0":3}
+→ 选1:2和2:1（出现最多的前2名），淘汰0:3和3:0
+
+规则三：【以下12个条件全部必填！不许偷懒留空！】
+
+========== 12个必填条件的选法 ==========
+
+1. 重号（必填）：看重号分布，选出现次数>=3的全部选项（通常0,1,2都要选！重号2有16%概率不能排除）
+2. 奇偶比（必填）：看分布，选出现次数>=5的（通常选2-3种，0:3和3:0如果出现次数不是极低也要留）
+3. 大小比（必填）：看分布，选出现次数>=5的（同上）
+4. 质合比（必填）：看分布，选出现次数>=5的
+5. AC值（必填）：看分布，选出现次数>=5的（通常AC=3和AC=2都要选）
+6. 和值（必填）：看分布，选出现次数>=2次的和值，约10-14个
+7. 连号（必填）：看分布，选出现次数>=3的（通常0和1都选）
+8. 和尾（必填）：看分布，选出现次数最高的6-7个值
+9. 遗漏总值（必填）：看区间分布，选出现次数最高的几个区间，格式[[5,9],[10,14],[15,19],...]
+10. 跨度（必填）：看分布，选出现次数>=2的值，约4-7个（即大小差值）
+11. 首尾差（必填）：看分布，选出现次数最高的5-7个值
+12. 012路（必填）：看分布，选出现次数>=3的012路组合（如["210","020","201"]）
+
+目标：最终过滤后 60-100 注。
+如果预估过滤后<40注，放宽1-2个条件（增加可选值）。
+如果预估过滤后>120注，收紧1-2个条件。
+
+========== JSON输出格式 ==========
+
 ```json
 {
   "target_issue": "下一期期号",
   "analysis": "简要分析思路(2-3句话)",
   "confidence": "高/中/低",
   "filters": {
-    "百位": [0,1,3,8],
-    "十位": [1,2,5,7],
-    "个位": [0,3,7,9],
-    "和值": [11,12,13,14,15,16,17,18],
-    "跨度": [4,5,6,7,8],
+    "百位": [],
+    "十位": [],
+    "个位": [],
+    "重号": {"上期号码": [2,3,3], "重号数": [0,1,2]},
+    "奇偶比": ["1:2","2:1","0:3"],
+    "大小比": ["1:2","2:1","0:3"],
+    "质合比": ["2:1","1:2"],
     "AC值": [2,3],
-    "奇偶比": ["2:1","1:2"],
-    "大小比": ["1:2","2:1"],
+    "和值": [9,10,11,12,13,14,15,17,18,19],
+    "连号": [0,1],
+    "和尾": [0,2,5,6,7,8],
+    "遗漏总值": [[5,9],[10,14],[15,19],[20,24],[25,29],[30,34],[35,39]],
+    "跨度": [3,4,5,6,7],
+    "首尾差": [0,1,2,3,4,5],
+    "012路": ["210","020","201","000","001","010"],
     "组选类型": [],
-    "012路": [],
-    "重号": {"上期号码": [2,6,1], "重号数": [0,1,2]},
-    "必含号码": [],
-    "和尾": [],
-    "质合比": [],
-    "连号": [],
-    "首尾差": []
+    "必含号码": []
   },
   "key_reasons": [
-    "理由1: ...",
-    "理由2: ...",
+    "理由1: 奇偶比选1:2和2:1，因为分布中这两种占86%(22+21/50)",
+    "理由2: AC值只选3，因为分布中AC=3占70%(35/50)",
     "理由3: ..."
   ],
   "risk_notes": ["风险点1", "风险点2"]
 }
 ```
 
-字段说明：
-- 百位/十位/个位: 保留的号码列表，每位选4-6个号码
-- 和值: 保留的和值列表(0-27)，通常选8-12个连续值
-- 跨度: 保留的跨度列表(0-9)，通常选4-6个值
-- AC值: 保留的AC值(0,1,2,3)
-- 奇偶比: 格式为"奇数个数:偶数个数"，如"2:1"
-- 大小比: 格式为"大号个数:小号个数"(>=5为大)，如"2:1"
-- 组选类型: 直选模式，此项必须留空[]！不要填任何值！
-- 012路: 三位各自除3余数组成的字符串，如"201"，留空=不过滤
-- 重号: 上期号码+允许的重号个数
-- 必含号码: 胆码(不定位)，留空=不设胆码
-- 和尾: 和值的个位数(0-9)，留空=不过滤
-- 质合比: 格式同奇偶比(1,2,3,5,7为质)，留空=不过滤
-- 连号: 连号对数(0,1,2)，留空=不过滤
-- 首尾差: 百位与个位差的绝对值(0-9)，留空=不过滤
-- 不需要的条件留空数组[]即可
+字段说明（全部必填的12项）：
+- 百位/十位/个位: 必须留空[]！不杀号！
+- 重号: 上期号码+允许的重号个数（必填）
+- 奇偶比: "奇数个数:偶数个数"，选前2高频（必填）
+- 大小比: "大号个数:小号个数"(>=5为大)，选前2高频（必填）
+- 质合比: 格式同奇偶比(1,2,3,5,7为质)，选前2高频（必填）
+- AC值: 选最高频的1-2个（必填）
+- 和值: 保留的和值列表(0-27)，选高频值8-12个（必填）
+- 连号: 连号对数(0,1,2)，选高频（必填）
+- 和尾: 和值个位数(0-9)，选6-7个高频值（必填）
+- 遗漏总值: 格式[[起,止],[起,止],...]，选高频区间（必填）
+- 跨度: 保留的跨度(0-9)=大小差值，选高频4-7个（必填）
+- 首尾差: |百位-个位|(0-9)，选高频5-7个（必填）
+- 012路: 三位各除3余数组成的字符串如"210"，选高频组合（必填）
+- 组选类型/必含号码: 留空[]
 
-你的回复必须只包含一个JSON代码块，不要有其他内容。用```json开头，```结尾。"""
+⚠️ key_reasons 里每条理由必须引用具体的统计数据！例如"AC值选3，因为分布中AC=3出现35次占70%"
+
+你的回复必须只包含一个JSON代码块，不要有其他内容。"""
 
 
 def analyze_and_filter(data, n_recent=50):
@@ -279,28 +320,120 @@ def analyze_and_filter(data, n_recent=50):
     next_issue_num = int(last_issue) + 1
     next_issue = str(next_issue_num)
 
-    # 精简prompt: 只取最近10期详情 + 关键统计，减少AI思考时间
     recent_10 = full_stats["近期开奖"][-10:]
+
+    # 预序列化，避免f-string中{}冲突
+    _s = json.dumps
+    _ne = False  # ensure_ascii=False shorthand
+    j_recent10 = _s(recent_10, ensure_ascii=_ne)
+    j_freq = _s(full_stats['号码频率'], ensure_ascii=_ne)
+    j_missing = _s(full_stats['当前遗漏'], ensure_ascii=_ne)
+    j_hotcold = _s(full_stats['热温冷号'], ensure_ascii=_ne)
+    j_sum = _s(full_stats['和值分布'], ensure_ascii=_ne)
+    j_span = _s(full_stats['跨度分布'], ensure_ascii=_ne)
+    j_ac = _s(full_stats['AC值分布'], ensure_ascii=_ne)
+    j_oe = _s(full_stats['奇偶比分布'], ensure_ascii=_ne)
+    j_bs = _s(full_stats['大小比分布'], ensure_ascii=_ne)
+    j_pc = _s(full_stats.get('质合比分布', {}), ensure_ascii=_ne)
+    j_consec = _s(full_stats['连号分布'], ensure_ascii=_ne)
+    j_repeat = _s(full_stats.get('重号分布', {}), ensure_ascii=_ne)
+    j_htdiff = _s(full_stats.get('首尾差分布', {}), ensure_ascii=_ne)
+    j_sumtail = _s(full_stats.get('和尾分布', {}), ensure_ascii=_ne)
+    j_trend = _s(full_stats['近10期趋势'], ensure_ascii=_ne)
+    j_misstotal = _s(full_stats.get('遗漏总值分布', {}), ensure_ascii=_ne)
+    j_012road = _s(full_stats.get('012路分布TOP10', {}), ensure_ascii=_ne)
 
     prompt = f"""福彩3D {next_issue}期过滤条件。上期:{last['d1']}{last['d2']}{last['d3']}，上期号码:{prev_nums}
 
-近10期: {json.dumps(recent_10, ensure_ascii=False)}
+近10期: {j_recent10}
 
-号码频率(近{n_recent}期): {json.dumps(full_stats['号码频率'], ensure_ascii=False)}
-遗漏值: {json.dumps(full_stats['当前遗漏'], ensure_ascii=False)}
-热温冷: {json.dumps(full_stats['热温冷号'], ensure_ascii=False)}
-和值TOP: {json.dumps(dict(list(full_stats['和值分布'].items())[:10]), ensure_ascii=False)}
-跨度: {json.dumps(full_stats['跨度分布'], ensure_ascii=False)}
-奇偶比: {json.dumps(full_stats['奇偶比分布'], ensure_ascii=False)}
-大小比: {json.dumps(full_stats['大小比分布'], ensure_ascii=False)}
-AC值: {json.dumps(full_stats['AC值分布'], ensure_ascii=False)}
-趋势: {json.dumps(full_stats['近10期趋势'], ensure_ascii=False)}
+========== 各位号码频率(近{n_recent}期) ==========
+{j_freq}
+遗漏值: {j_missing}
+热温冷: {j_hotcold}
 
-输出过滤条件JSON，目标20-80注。"""
+========== 和值分布(近{n_recent}期，共28种) ==========
+{j_sum}
+★ 选出现次数>=2的高频值，目标8-12个
+
+========== 跨度分布(近{n_recent}期，共10种) ==========
+{j_span}
+★ 选出现次数>=2的值，目标4-7个
+
+========== AC值分布(近{n_recent}期，共4种) ==========
+{j_ac}
+★ 选出现次数最高的1-2个
+
+========== 奇偶比分布(近{n_recent}期，共4种) ==========
+{j_oe}
+★ 选出现次数最高的2种
+
+========== 大小比分布(近{n_recent}期，共4种) ==========
+{j_bs}
+★ 选出现次数最高的2种
+
+========== 质合比分布(近{n_recent}期，共4种) ==========
+{j_pc}
+★ 选出现次数最高的2种
+
+========== 连号分布(近{n_recent}期) ==========
+{j_consec}
+★ 选出现次数最高的(通常0和1)
+
+========== 重号分布(近{n_recent}期) ==========
+{j_repeat}
+★ 选出现次数最高的(通常0和1)
+
+========== 首尾差分布(近{n_recent}期) ==========
+{j_htdiff}
+★ 选出现次数最高的5-7个值（必填！）
+
+========== 和尾分布(近{n_recent}期) ==========
+{j_sumtail}
+★ 选出现次数最高的6-7个值（必填！）
+
+========== 遗漏总值分布(近{n_recent}期，按区间) ==========
+{j_misstotal}
+★ 选出现次数最高的区间（必填！格式[[5,9],[10,14],[15,19],...]）
+
+========== 012路分布TOP10(近{n_recent}期) ==========
+{j_012road}
+★ 选出现次数>=3的012路组合（必填！）
+
+趋势: {j_trend}
+
+⚠️ 核心要求：
+1. 百位/十位/个位留空[]，不杀号！
+2. 以下条件全部必填，不许留空：奇偶比、大小比、质合比、AC值、和值、跨度、连号、重号、首尾差、和尾、遗漏总值、012路
+3. 每个条件必须基于上面的统计分布数据选高频选项！
+4. key_reasons里必须引用具体统计数字！
+输出过滤条件JSON，目标60-100注。"""
 
     raw = _call_llm(FILTER_SYSTEM_PROMPT, prompt, max_tokens=4000)
     conditions = parse_filter_json(raw)
     return raw, conditions, next_issue
+
+
+def analyze_and_filter_auto(data, n_recent=50):
+    """
+    覆盖率自动过滤（不依赖AI选条件）。
+
+    用历史统计分布自动计算每个过滤条件的选值。
+    返回格式与 analyze_and_filter() 完全兼容:
+        (description_text, conditions_dict, next_issue)
+    """
+    result = auto_select.build_auto_conditions(data, n_recent)
+    next_issue = result["target_issue"]
+
+    # 构建描述文本
+    lines = [result["analysis"]]
+    if result.get("key_reasons"):
+        lines.append("\n选择依据:")
+        for r in result["key_reasons"]:
+            lines.append(f"  {r}")
+    raw_text = "\n".join(lines)
+
+    return raw_text, result, next_issue
 
 
 def parse_filter_json(ai_response):

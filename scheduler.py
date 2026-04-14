@@ -135,7 +135,8 @@ def step3_generate_tomorrow(data, logf):
     log("步骤3: 生成下一期AI过滤方案", logf)
 
     try:
-        raw, parsed, next_issue = ai.analyze_and_filter(data, config.DEFAULT_RECENT_PERIODS)
+        filter_func = ai.analyze_and_filter_auto if getattr(config, 'FILTER_MODE', 'auto') == 'auto' else ai.analyze_and_filter
+        raw, parsed, next_issue = filter_func(data, config.DEFAULT_RECENT_PERIODS)
         filters = parsed["filters"]
 
         log(f"目标期号: {next_issue}", logf)
@@ -145,7 +146,8 @@ def step3_generate_tomorrow(data, logf):
         # 执行过滤
         last = data[-1]
         prev = [last["d1"], last["d2"], last["d3"]]
-        numbers, filter_log = fe.apply_filters(filters, prev)
+        missing_data = st.calc_missing_values(data)
+        numbers, filter_log = fe.apply_filters(filters, prev, missing_data=missing_data)
 
         for line in filter_log:
             log(f"  {line}", logf)
@@ -155,18 +157,10 @@ def step3_generate_tomorrow(data, logf):
 
         if result_count == 0:
             log("结果为0注! 放宽条件重试...", logf)
-            for key in ["012路", "必含号码", "和尾", "质合比", "连号", "首尾差"]:
+            for key in ["012路", "必含号码", "和尾", "质合比", "连号", "首尾差", "遗漏总值"]:
                 if key in filters:
                     filters[key] = []
-            for key in ["百位", "十位", "个位"]:
-                if key in filters and len(filters[key]) < 6:
-                    existing = set(filters[key])
-                    for d in range(10):
-                        if len(existing) >= 7:
-                            break
-                        existing.add(d)
-                    filters[key] = sorted(existing)
-            numbers, filter_log = fe.apply_filters(filters, prev)
+            numbers, filter_log = fe.apply_filters(filters, prev, missing_data=missing_data)
             result_count = len(numbers)
             log(f"放宽后: {result_count}注", logf)
 
@@ -263,10 +257,95 @@ def run_daily_task():
             log(f"  明日方案: {tomorrow['issue']}期 {tomorrow['count']}注 已生成", logf)
         log("=" * 50, logf)
 
+        # 步骤4: 推送TG
+        send_tg_summary(data, today_result, review, tomorrow, logf)
+
     except Exception as e:
         log(f"任务异常: {e}", logf)
         import traceback
         traceback.print_exc()
+        # 异常也尝试推送
+        try:
+            send_tg_message(f"❌ FC3D_AI每日任务异常: {e}")
+        except:
+            pass
+
+
+def send_tg_message(text):
+    """直接HTTP发TG消息（不需要tg_bot.py运行）"""
+    token = config.TG_BOT_TOKEN
+    chat_id = config.TG_ADMIN_ID
+    if not token or not chat_id:
+        return
+    import urllib.request
+    import urllib.parse
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    # 分段发送
+    while text:
+        chunk = text[:4000]
+        text = text[4000:]
+        data = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": chunk,
+        }).encode()
+        try:
+            urllib.request.urlopen(url, data, timeout=30)
+        except Exception:
+            pass
+
+
+def send_tg_summary(data, today_result, review, tomorrow, logf):
+    """每日任务完成后推送TG汇总"""
+    token = config.TG_BOT_TOKEN
+    chat_id = config.TG_ADMIN_ID
+    if not token or not chat_id:
+        log("TG未配置，跳过推送", logf)
+        return
+
+    lines = ["⏰ FC3D_AI 每日报告", "━━━━━━━━━━━━━━━━━━"]
+
+    # 今日开奖
+    if today_result:
+        lines.append(f"📥 开奖: {today_result['issue']}期 → {today_result['d1']}{today_result['d2']}{today_result['d3']}")
+
+    # 复盘
+    if review:
+        if review.get("any_hit"):
+            lines.append("🎉 复盘: 命中!")
+        else:
+            lines.append("❌ 复盘: 未命中")
+        for r in review.get("results", []):
+            status = "🎉命中" if r["hit"] else "❌未中"
+            lines.append(f"  {r['filename']}: {r['count']}注 {status}")
+
+    # 明日方案
+    if tomorrow:
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🎯 {tomorrow['issue']}期 过滤结果: {tomorrow['count']}注")
+        lines.append(f"💰 成本: {tomorrow['count']*2}元")
+
+        # 读GL文件获取号码
+        gl_dir = get_gl_dir()
+        gl_files = sorted([f for f in os.listdir(gl_dir) if f.startswith(f"GL{tomorrow['issue']}")])
+        if gl_files:
+            gl_path = os.path.join(gl_dir, gl_files[-1])
+            try:
+                with open(gl_path, "r", encoding="gb18030") as f:
+                    gl_lines = f.read().strip().split("\n")
+                nums = [l.strip() for l in gl_lines[1:] if l.strip()]
+                # 分行显示
+                cols = 10
+                for i in range(0, len(nums), cols):
+                    row = nums[i:i+cols]
+                    lines.append(" ".join(row))
+            except:
+                pass
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+
+    msg = "\n".join(lines)
+    send_tg_message(msg)
+    log("已推送TG", logf)
 
 
 def run_daemon():

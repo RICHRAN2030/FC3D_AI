@@ -148,30 +148,41 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # AI分析 (线程池+typing提示)
         raw, parsed, next_issue = await run_with_typing(
             update.effective_chat.id, context.bot,
-            asyncio.to_thread(ai.analyze_and_filter, data, config.DEFAULT_RECENT_PERIODS)
+            asyncio.to_thread(
+                ai.analyze_and_filter_auto if getattr(config, 'FILTER_MODE', 'auto') == 'auto' else ai.analyze_and_filter,
+                data, config.DEFAULT_RECENT_PERIODS
+            )
         )
         filters_dict = parsed["filters"]
 
         # 执行过滤
         prev = [last["d1"], last["d2"], last["d3"]]
-        numbers, flog = fe.apply_filters(filters_dict, prev)
+        missing_data = st.calc_missing_values(data)
+        numbers, flog = fe.apply_filters(filters_dict, prev, missing_data=missing_data)
 
         # 0注则放宽
         if len(numbers) == 0:
-            for k in ["012路", "必含号码", "和尾", "质合比", "连号", "首尾差"]:
+            for k in ["012路", "必含号码", "和尾", "质合比", "连号", "首尾差", "遗漏总值"]:
                 if k in filters_dict:
                     filters_dict[k] = []
-            for k in ["百位", "十位", "个位"]:
-                if k in filters_dict and len(filters_dict[k]) < 6:
-                    s = set(filters_dict[k])
-                    for d in range(10):
-                        if len(s) >= 7:
-                            break
-                        s.add(d)
-                    filters_dict[k] = sorted(s)
-            numbers, flog = fe.apply_filters(filters_dict, prev)
+            numbers, flog = fe.apply_filters(filters_dict, prev, missing_data=missing_data)
 
         count = len(numbers)
+
+        # 出手判断
+        import auto_select
+        max_notes = getattr(auto_select, "MAX_BET_NOTES", 150)
+        if count > max_notes:
+            await msg.edit_text(
+                f"⏭️ {next_issue}期 建议跳过\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"过滤后{count}注 > {max_notes}注阈值\n"
+                f"条件不够收敛，成本过高({count*2}元)\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💡 等条件更收敛时再出手"
+            )
+            logger.info(f"{next_issue}期跳过: {count}注>{max_notes}")
+            return
 
         # 保存GL
         gl_dir = get_gl_dir()
@@ -518,25 +529,21 @@ async def run_daily_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         raw, parsed, next_issue = await run_with_typing(
             chat_id, context.bot,
-            asyncio.to_thread(ai.analyze_and_filter, data, config.DEFAULT_RECENT_PERIODS)
+            asyncio.to_thread(
+                ai.analyze_and_filter_auto if getattr(config, 'FILTER_MODE', 'auto') == 'auto' else ai.analyze_and_filter,
+                data, config.DEFAULT_RECENT_PERIODS
+            )
         )
         filters_dict = parsed["filters"]
         prev = [latest["d1"], latest["d2"], latest["d3"]]
-        numbers, flog = fe.apply_filters(filters_dict, prev)
+        missing_data = st.calc_missing_values(data)
+        numbers, flog = fe.apply_filters(filters_dict, prev, missing_data=missing_data)
 
         if len(numbers) == 0:
-            for k in ["012路", "必含号码", "和尾", "质合比", "连号", "首尾差"]:
+            for k in ["012路", "必含号码", "和尾", "质合比", "连号", "首尾差", "遗漏总值"]:
                 if k in filters_dict:
                     filters_dict[k] = []
-            for k in ["百位", "十位", "个位"]:
-                if k in filters_dict and len(filters_dict[k]) < 6:
-                    s = set(filters_dict[k])
-                    for d in range(10):
-                        if len(s) >= 7:
-                            break
-                        s.add(d)
-                    filters_dict[k] = sorted(s)
-            numbers, flog = fe.apply_filters(filters_dict, prev)
+            numbers, flog = fe.apply_filters(filters_dict, prev, missing_data=missing_data)
 
         count = len(numbers)
 

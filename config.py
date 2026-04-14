@@ -25,7 +25,7 @@ API_PROVIDER = "poe"  # "poe" 或 "anthropic"
 POE_API_KEY = os.environ.get("POE_API_KEY", "")
 POE_BASE_URL = "https://api.poe.com/v1"
 POE_MODEL = "claude-opus-4.6"
-POE_OUTPUT_EFFORT = "high"  # 思考等级: "low" / "medium" / "high" / "max" (max容易超时)
+POE_OUTPUT_EFFORT = "max"  # 思考等级: "low" / "medium" / "high" / "max"
 
 # Anthropic (备选)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -40,6 +40,24 @@ HISTORY_CSV = os.path.join(DATA_DIR, "history_3d.csv")
 # ==================== 分析配置 ====================
 DEFAULT_RECENT_PERIODS = 50
 MAX_CONTEXT_PERIODS = 100
+
+# ==================== 自动过滤配置 ====================
+FILTER_MODE = "auto"  # "auto" = 覆盖率自动选择(推荐), "ai" = AI选择(旧)
+AUTO_FILTER_COVERAGE = 0.90  # 全局默认覆盖率目标
+
+# Howard策略开关
+HOWARD_SUM_ZONE_ENABLED = True      # 70%和值法则
+HOWARD_BIAS_ENABLED = True          # 偏差回归
+HOWARD_ADJACENT_ENABLED = True      # 相邻号码
+HOWARD_SKIP_HIT_ENABLED = False     # 跳期分析(默认关闭,会杀号)
+HOWARD_COMPANION_ENABLED = False    # 伴随号码(默认关闭,胆码过于激进)
+
+# 排除选项：这些值永远不会被自动选中
+EXCLUDE_OPTIONS = {
+    "奇偶比": ["3:0"],      # 不选全奇
+    "大小比": ["3:0"],      # 不选全大
+    # 质合比不排除：复盘发现3:0连续出现3期(077-079)
+}
 
 # ==================== 定时任务配置 ====================
 SCHEDULE_HOUR = 22       # 每天几点执行 (24小时制)

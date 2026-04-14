@@ -213,6 +213,7 @@ def build_full_stats(data, n_recent=50):
     for d in recent:
         road_counts[calc_012_road(d["d1"], d["d2"], d["d3"])] += 1
     stats["012路分布TOP10"] = dict(road_counts.most_common(10))
+    stats["012路分布全部"] = dict(road_counts.most_common())
 
     # 11. AC值分布
     ac_counts = Counter()
@@ -229,7 +230,45 @@ def build_full_stats(data, n_recent=50):
     # 13. 连号分布
     stats["连号分布"] = dict(calc_consecutive_patterns(data, n_recent).most_common())
 
-    # 14. 趋势信号 (最近10期的变化)
+    # 14. 质合比分布
+    pc_counts = Counter()
+    for d in recent:
+        pc_counts[calc_prime_composite(d["d1"], d["d2"], d["d3"])] += 1
+    stats["质合比分布"] = dict(pc_counts.most_common())
+
+    # 15. 重号分布 (与上期重复号码个数)
+    repeat_counts = Counter()
+    for i, d in enumerate(recent):
+        prev = recent[i - 1] if i > 0 else (data[-n_recent - 1] if len(data) > n_recent else None)
+        repeat_counts[calc_repeat_with_prev(d, prev)] += 1
+    stats["重号分布"] = dict(sorted(repeat_counts.items()))
+
+    # 16. 首尾差分布 (百位-个位的绝对值)
+    htd_counts = Counter()
+    for d in recent:
+        htd_counts[abs(d["d1"] - d["d3"])] += 1
+    stats["首尾差分布"] = dict(sorted(htd_counts.items()))
+
+    # 17. 和尾分布 (和值个位数)
+    st_counts = Counter()
+    for d in recent:
+        st_counts[(d["d1"] + d["d2"] + d["d3"]) % 10] += 1
+    stats["和尾分布"] = dict(sorted(st_counts.items()))
+
+    # 18. 遗漏总值分布 (百位遗漏+十位遗漏+个位遗漏，按区间统计)
+    missing = stats["当前遗漏"]  # 已经在前面计算过
+    # 用全部数据计算每期的遗漏总值
+    all_missing = calc_missing_values(data)
+    mt_counts = Counter()
+    for d in recent:
+        # 计算该号码在当期之前的遗漏值之和(近似用当前遗漏值)
+        mt = all_missing["百位"].get(d["d1"], 0) + all_missing["十位"].get(d["d2"], 0) + all_missing["个位"].get(d["d3"], 0)
+        # 按5为步长分区间
+        bucket = (mt // 5) * 5
+        mt_counts[f"{bucket}-{bucket+4}"] += 1
+    stats["遗漏总值分布"] = dict(sorted(mt_counts.items(), key=lambda x: int(x[0].split('-')[0])))
+
+    # 19. 趋势信号 (最近10期的变化)
     last10 = recent[-10:]
     stats["近10期趋势"] = {
         "和值走势": [calc_sum(d["d1"], d["d2"], d["d3"]) for d in last10],
@@ -237,7 +276,241 @@ def build_full_stats(data, n_recent=50):
         "AC值走势": [calc_ac(d["d1"], d["d2"], d["d3"]) for d in last10],
     }
 
+    # ========== Howard 策略统计 ==========
+
+    # 20. Howard 70%和值区间
+    stats["Howard和值区间"] = calc_howard_sum_zone(data, max(n_recent, 100))
+
+    # 21. 偏差回归
+    stats["偏差回归"] = calc_bias_tracker(data, min(n_recent, 30))
+
+    # 22. 相邻号码统计
+    stats["相邻号码统计"] = calc_adjacent_stats(data, n_recent)
+
+    # 23. 跳期分析
+    stats["跳期分析"] = calc_skip_hit(data, max(n_recent, 100))
+
+    # 24. 伴随号码
+    stats["伴随号码"] = calc_companion_matrix(data, max(n_recent, 100))
+
     return stats
+
+
+# ============================================================
+# Howard 策略统计函数
+# ============================================================
+
+def calc_howard_sum_zone(data, n_recent=100, target_pct=0.70):
+    """
+    Howard 70%法则: 找到覆盖70%开奖的最窄连续和值区间。
+    用滑动窗口从最窄宽度开始搜索。
+    """
+    recent = data[-n_recent:]
+    sums = [d["d1"] + d["d2"] + d["d3"] for d in recent]
+    total = len(sums)
+    target_count = int(total * target_pct)
+
+    # 和值分布 (0-27)
+    dist = Counter(sums)
+
+    best_low, best_high, best_width = 0, 27, 28
+    # 从最小窗口宽度开始搜索
+    for width in range(1, 28):
+        for low in range(0, 28 - width):
+            high = low + width
+            count = sum(dist.get(s, 0) for s in range(low, high + 1))
+            if count >= target_count and width < best_width:
+                best_low, best_high, best_width = low, high, width
+                break  # 找到该宽度的最优起点就跳到下一个宽度
+        if best_width <= width:
+            break  # 已找到最窄窗口
+
+    covered = sum(dist.get(s, 0) for s in range(best_low, best_high + 1))
+    return {
+        "zone_low": best_low,
+        "zone_high": best_high,
+        "zone_width": best_high - best_low + 1,
+        "coverage": covered / total if total > 0 else 0,
+        "covered_count": covered,
+        "total": total,
+    }
+
+
+def calc_bias_tracker(data, n_recent=30):
+    """
+    Howard 偏差回归: 双窗口检测奇偶比/大小比/和值偏差。
+    当短期(10期)和中期(20期)都偏离均值 → 预测回归。
+    """
+    result = {}
+
+    for name, calc_fn, expected in [
+        ("odd_even", lambda d: sum(1 for x in [d["d1"], d["d2"], d["d3"]] if x % 2 == 1), 1.5),
+        ("big_small", lambda d: sum(1 for x in [d["d1"], d["d2"], d["d3"]] if x >= 5), 1.5),
+    ]:
+        recent10 = data[-10:]
+        recent20 = data[-20:]
+
+        avg10 = sum(calc_fn(d) for d in recent10) / len(recent10)
+        avg20 = sum(calc_fn(d) for d in recent20) / len(recent20)
+
+        # 偏差方向
+        bias10 = "偏高" if avg10 > expected + 0.3 else ("偏低" if avg10 < expected - 0.3 else "均衡")
+        bias20 = "偏高" if avg20 > expected + 0.2 else ("偏低" if avg20 < expected - 0.2 else "均衡")
+
+        # 回归信号: 两个窗口同方向偏离
+        revert = bias10 != "均衡" and bias10 == bias20
+
+        # 推荐
+        recommendations = []
+        if name == "odd_even":
+            if revert and bias10 == "偏高":
+                recommendations = ["0:3", "1:2"]  # 偏奇 → 推偶
+            elif revert and bias10 == "偏低":
+                recommendations = ["3:0", "2:1"]  # 偏偶 → 推奇
+        elif name == "big_small":
+            if revert and bias10 == "偏高":
+                recommendations = ["0:3", "1:2"]  # 偏大 → 推小
+            elif revert and bias10 == "偏低":
+                recommendations = ["3:0", "2:1"]  # 偏小 → 推大
+
+        result[name] = {
+            "avg10": round(avg10, 2),
+            "avg20": round(avg20, 2),
+            "bias10": bias10,
+            "bias20": bias20,
+            "revert": revert,
+            "recommendations": recommendations,
+        }
+
+    # 和值偏差
+    recent10 = data[-10:]
+    recent20 = data[-20:]
+    sum10 = sum(d["d1"] + d["d2"] + d["d3"] for d in recent10) / 10
+    sum20 = sum(d["d1"] + d["d2"] + d["d3"] for d in recent20) / 20
+    expected_sum = 13.5  # 理论均值
+
+    result["sum"] = {
+        "avg10": round(sum10, 1),
+        "avg20": round(sum20, 1),
+        "bias": "偏高" if sum10 > 16 and sum20 > 15 else ("偏低" if sum10 < 11 and sum20 < 12 else "正常"),
+    }
+
+    return result
+
+
+def calc_adjacent_stats(data, n_recent=50):
+    """
+    Howard 相邻号码: 上期号码±1的数字下期出现概率更高。
+    """
+    recent = data[-n_recent:]
+    hit_counts = Counter()
+
+    for i in range(1, len(recent)):
+        prev = recent[i - 1]
+        curr = recent[i]
+        # 上期号码的相邻数字池
+        adj_pool = set()
+        for d in [prev["d1"], prev["d2"], prev["d3"]]:
+            adj_pool.add((d - 1) % 10)
+            adj_pool.add((d + 1) % 10)
+        # 本期号码命中几个相邻数字
+        curr_digits = {curr["d1"], curr["d2"], curr["d3"]}
+        hit_count = len(curr_digits & adj_pool)
+        hit_counts[hit_count] += 1
+
+    # 当前相邻池 (基于最新一期)
+    last = data[-1]
+    current_pool = set()
+    for d in [last["d1"], last["d2"], last["d3"]]:
+        current_pool.add((d - 1) % 10)
+        current_pool.add((d + 1) % 10)
+
+    return {
+        "分布": dict(sorted(hit_counts.items())),
+        "当前相邻池": sorted(current_pool),
+    }
+
+
+def calc_skip_hit(data, n_recent=100):
+    """
+    Howard 跳期分析: 每个位置每个数字的跳期规律。
+    due_ratio = 当前跳期 / 平均跳期, >=0.8 表示"即将出现"
+    """
+    recent = data[-n_recent:]
+    result = {}
+
+    for pos_name, key in [("百位", "d1"), ("十位", "d2"), ("个位", "d3")]:
+        pos_result = {}
+        for digit in range(10):
+            # 找到所有出现位置
+            appearances = [i for i, d in enumerate(recent) if d[key] == digit]
+            if len(appearances) < 2:
+                avg_skip = n_recent  # 极少出现
+            else:
+                # 计算各次跳期
+                skips = [appearances[j] - appearances[j - 1] for j in range(1, len(appearances))]
+                avg_skip = sum(skips) / len(skips)
+
+            # 当前跳期(距最后一次出现)
+            current_skip = n_recent - 1 - appearances[-1] if appearances else n_recent
+
+            due_ratio = current_skip / avg_skip if avg_skip > 0 else 0
+
+            pos_result[digit] = {
+                "avg_skip": round(avg_skip, 1),
+                "current": current_skip,
+                "due_ratio": round(due_ratio, 2),
+            }
+        result[pos_name] = pos_result
+
+    return result
+
+
+def calc_companion_matrix(data, n_recent=100):
+    """
+    Howard 伴随号码: 哪些数字经常一起出现。
+    """
+    recent = data[-n_recent:]
+
+    # 10x10 共现矩阵
+    matrix = [[0] * 10 for _ in range(10)]
+    for d in recent:
+        digits = [d["d1"], d["d2"], d["d3"]]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                a, b = digits[i], digits[j]
+                matrix[a][b] += 1
+                matrix[b][a] += 1
+
+    # 每个数字的TOP3伴随
+    top_companions = {}
+    for digit in range(10):
+        pairs = [(other, matrix[digit][other]) for other in range(10) if other != digit]
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        top_companions[digit] = [(p[0], p[1]) for p in pairs[:3]]
+
+    # 找强候选: 热号的共同高频伴随
+    hot_cold = calc_hot_cold(data, min(n_recent, 30))
+    hot_digits = set()
+    for pos in ["百位", "十位", "个位"]:
+        hot_digits.update(hot_cold[pos]["热"])
+
+    # 统计哪个数字是最多热号的TOP3伴随
+    companion_count = Counter()
+    for hd in hot_digits:
+        for comp, freq in top_companions.get(hd, []):
+            companion_count[comp] += 1
+
+    strong = None
+    if companion_count:
+        best_digit, best_count = companion_count.most_common(1)[0]
+        if best_count >= 2:  # 至少是2个热号的TOP3伴随
+            strong = best_digit
+
+    return {
+        "top_companions": {str(k): v for k, v in top_companions.items()},
+        "strong_candidate": strong,
+    }
 
 
 def backtest_filter(data, filter_numbers_func, start_idx=100, end_idx=None):

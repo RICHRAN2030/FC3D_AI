@@ -176,6 +176,47 @@ def filter_exclude_numbers(numbers, exclude_list):
     return [(a, b, c) for a, b, c in numbers if (a, b, c) not in eset]
 
 
+def filter_missing_total(numbers, ranges, missing_data=None):
+    """遗漏总值过滤 - ranges: [[5,9],[10,14],[15,19],[20,24],[25,29],[30,34],[35,39]]
+    missing_data: {"百位":{0:遗漏值,...}, "十位":{...}, "个位":{...}}
+    遗漏总值 = 百位遗漏值 + 十位遗漏值 + 个位遗漏值
+    """
+    if not ranges or not missing_data:
+        return numbers
+    def in_ranges(val):
+        for r in ranges:
+            if r[0] <= val <= r[1]:
+                return True
+        return False
+    h_miss = missing_data.get("百位", {})
+    t_miss = missing_data.get("十位", {})
+    u_miss = missing_data.get("个位", {})
+    return [(a, b, c) for a, b, c in numbers
+            if in_ranges(h_miss.get(a, 0) + t_miss.get(b, 0) + u_miss.get(c, 0))]
+
+
+def filter_adjacent(numbers, adj_data):
+    """相邻号码过滤 - adj_data: {"邻数集合": [1,3,5,6,8,9], "最少包含": [1,2,3]}
+    要求组合中至少N个数字在相邻池中"""
+    adj_set = set(adj_data.get("邻数集合", []))
+    min_counts = set(adj_data.get("最少包含", []))
+    if not adj_set or not min_counts:
+        return numbers
+    def count_adj(a, b, c):
+        return sum(1 for x in {a, b, c} if x in adj_set)
+    return [(a, b, c) for a, b, c in numbers if count_adj(a, b, c) in min_counts]
+
+
+def filter_due_digits(numbers, due_data):
+    """跳期过滤 - due_data: {"百位": [eligible], "十位": [...], "个位": [...]}
+    只保留每位包含'该出'数字的组合"""
+    h_set = set(due_data.get("百位", range(10)))
+    t_set = set(due_data.get("十位", range(10)))
+    u_set = set(due_data.get("个位", range(10)))
+    return [(a, b, c) for a, b, c in numbers
+            if a in h_set and b in t_set and c in u_set]
+
+
 def filter_must_contain(numbers, must_digits):
     """必含号码(胆码) - must_digits: [8] 或 [8,7]"""
     if not must_digits:
@@ -212,39 +253,36 @@ FILTER_MAP = {
     "首尾差":     ("head_tail",     filter_head_tail_diff),
     "必含号码":   ("must_contain",  filter_must_contain),
     "排除号码":   ("exclude",       filter_exclude_numbers),
+    "跳期过滤":   ("due_digits",   filter_due_digits),
 }
 
 
-def apply_filters(conditions, prev_number=None):
+def apply_filters(conditions, prev_number=None, missing_data=None):
     """
     应用过滤条件，返回过滤后号码列表及过程日志
-
-    conditions: dict, 例如:
-    {
-        "百位": [0, 1, 3, 8],
-        "十位": [1, 2, 5, 7],
-        "个位": [0, 3, 7, 9],
-        "和值": [11, 12, 13, 14, 15, 16, 17, 18],
-        "跨度": [4, 5, 6, 7, 8],
-        "AC值": [3],
-        "奇偶比": ["2:1", "1:2"],
-        "大小比": ["1:2", "2:1"],
-        "012路": ["201", "101", "120"],
-        "组选类型": ["组六"],
-        "重号": {"上期号码": [2, 6, 1], "重号数": [0, 1, 2]},
-        "必含号码": [8],
-    }
-
-    返回: (filtered_numbers, log_lines)
+    missing_data: 遗漏值数据（用于遗漏总值过滤）
     """
     numbers = generate_all()
     log = []
     log.append(f"起始: {len(numbers)} 注")
 
-    # 按预定顺序过滤（先位置过滤缩小范围，再指标过滤）
-    order = ["百位", "十位", "个位", "组选类型", "和值", "跨度", "AC值",
-             "奇偶比", "大小比", "012路", "和尾", "质合比", "连号",
-             "首尾差", "必含号码", "排除号码"]
+    # 过滤顺序（含Howard策略）
+    order = ["百位", "十位", "个位", "组选类型",
+             "重号",          # 与上期重号
+             "相邻号码",      # Howard: 上期±1号码
+             "奇偶比",
+             "大小比",
+             "质合比",
+             "AC值",
+             "和值",
+             "连号",
+             "和尾",
+             "遗漏总值",
+             "跨度",
+             "首尾差",
+             "012路",
+             "跳期过滤",      # Howard: 跳期分析(默认关闭)
+             "必含号码", "排除号码"]
 
     for key in order:
         if key not in conditions:
@@ -255,14 +293,18 @@ def apply_filters(conditions, prev_number=None):
 
         before = len(numbers)
 
-        if key in FILTER_MAP:
-            _, func = FILTER_MAP[key]
-            numbers = func(numbers, val)
-        elif key == "重号" and isinstance(val, dict):
+        if key == "重号" and isinstance(val, dict):
             prev = val.get("上期号码", prev_number)
             counts = val.get("重号数", [0, 1, 2])
             if prev:
                 numbers = filter_repeat_with_prev(numbers, prev, counts)
+        elif key == "相邻号码" and isinstance(val, dict):
+            numbers = filter_adjacent(numbers, val)
+        elif key == "遗漏总值" and isinstance(val, list) and missing_data:
+            numbers = filter_missing_total(numbers, val, missing_data)
+        elif key in FILTER_MAP:
+            _, func = FILTER_MAP[key]
+            numbers = func(numbers, val)
 
         after = len(numbers)
         eliminated = before - after
